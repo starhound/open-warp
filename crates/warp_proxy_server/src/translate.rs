@@ -1,13 +1,19 @@
-//! Translates between Warp's multi-agent proto and the provider-neutral [`ChatRequest`].
+//! Translates between Warp's multi-agent proto and the provider-neutral chat format.
+//!
+//! `request_to_chat` walks the existing task history + new user input to assemble a
+//! provider-ready chat with tool-use / tool-result content blocks. The streaming side
+//! (in `lib.rs`) drives a `ChatStream` and emits Warp `ResponseEvent`s — this file owns
+//! the proto-construction helpers used there.
 
 use prost_types::FieldMask;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
-use crate::providers::{ChatMessage, ChatRequest, ChatRole};
+use crate::providers::{ChatMessage, ChatRequest, ChatRole, ContentBlock, ToolSpec};
+use crate::tools;
 
-/// Walk the request's task history + new input and build a chat-history list. Phase 2.1 only
-/// extracts plain text — tool calls, todos, reasoning, etc. are left for later phases.
+/// Walk the request's task history + new input and build a chat-history list together with
+/// metadata about the active conversation.
 pub fn request_to_chat(req: &api::Request) -> Result<(ChatRequest, ConversationCtx), &'static str> {
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut active_task_id: Option<String> = None;
@@ -17,11 +23,7 @@ pub fn request_to_chat(req: &api::Request) -> Result<(ChatRequest, ConversationC
             active_task_id.get_or_insert_with(|| task.id.clone());
             for m in &task.messages {
                 if let Some(payload) = m.message.as_ref() {
-                    if let Some((role, text)) = message_to_text(payload) {
-                        if !text.trim().is_empty() {
-                            messages.push(ChatMessage { role, text });
-                        }
-                    }
+                    add_history_message(&mut messages, payload);
                 }
             }
         }
@@ -31,13 +33,20 @@ pub fn request_to_chat(req: &api::Request) -> Result<(ChatRequest, ConversationC
         Some(api::request::input::Type::UserInputs(inputs)) => {
             let mut text = String::new();
             for ui in &inputs.inputs {
-                if let Some(api::request::input::user_inputs::user_input::Input::UserQuery(uq)) =
-                    ui.input.as_ref()
-                {
-                    if !text.is_empty() {
-                        text.push('\n');
+                let Some(input) = ui.input.as_ref() else {
+                    continue;
+                };
+                match input {
+                    api::request::input::user_inputs::user_input::Input::UserQuery(uq) => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&uq.query);
                     }
-                    text.push_str(&uq.query);
+                    api::request::input::user_inputs::user_input::Input::ToolCallResult(r) => {
+                        push_input_tool_result(&mut messages, r);
+                    }
+                    _ => {}
                 }
             }
             text
@@ -47,21 +56,26 @@ pub fn request_to_chat(req: &api::Request) -> Result<(ChatRequest, ConversationC
         _ => String::new(),
     };
 
-    if new_user_text.trim().is_empty() && messages.is_empty() {
-        return Err("no user text in request");
+    if !new_user_text.is_empty() {
+        push_user_text(&mut messages, new_user_text.clone());
     }
 
-    if !new_user_text.is_empty() {
-        messages.push(ChatMessage {
-            role: ChatRole::User,
-            text: new_user_text.clone(),
-        });
+    if messages.is_empty() {
+        return Err("empty chat — no user input and no history");
     }
+
+    let supported_tools: Vec<i32> = req
+        .settings
+        .as_ref()
+        .map(|s| s.supported_tools.clone())
+        .unwrap_or_default();
+    let tools: Vec<ToolSpec> = tools::build_tool_specs(&supported_tools);
 
     let chat = ChatRequest {
-        system: None,
+        system: Some(tools::system_prompt()),
         messages,
-        max_tokens: 4096,
+        tools,
+        max_tokens: 8192,
     };
 
     let ctx = ConversationCtx {
@@ -72,19 +86,118 @@ pub fn request_to_chat(req: &api::Request) -> Result<(ChatRequest, ConversationC
     Ok((chat, ctx))
 }
 
+fn add_history_message(messages: &mut Vec<ChatMessage>, payload: &api::message::Message) {
+    use api::message::Message as M;
+    match payload {
+        M::UserQuery(uq) => push_user_text(messages, uq.query.clone()),
+        M::AgentOutput(ao) => push_assistant_text(messages, ao.text.clone()),
+        M::ToolCall(call) => push_tool_call(messages, call),
+        M::ToolCallResult(r) => push_tool_result(messages, r),
+        // Other message types (reasoning, todos, citations, server events, etc.) are
+        // currently summarized as system-style notes via `push_assistant_text` if
+        // they carry display text, otherwise dropped.
+        M::AgentReasoning(r) if !r.reasoning.is_empty() => {
+            push_assistant_text(messages, r.reasoning.clone());
+        }
+        _ => {}
+    }
+}
+
+fn push_user_text(messages: &mut Vec<ChatMessage>, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(last) = messages.last_mut() {
+        if last.role == ChatRole::User {
+            last.content.push(ContentBlock::Text(text));
+            return;
+        }
+    }
+    messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: vec![ContentBlock::Text(text)],
+    });
+}
+
+fn push_assistant_text(messages: &mut Vec<ChatMessage>, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(last) = messages.last_mut() {
+        if last.role == ChatRole::Assistant {
+            last.content.push(ContentBlock::Text(text));
+            return;
+        }
+    }
+    messages.push(ChatMessage {
+        role: ChatRole::Assistant,
+        content: vec![ContentBlock::Text(text)],
+    });
+}
+
+fn push_tool_call(messages: &mut Vec<ChatMessage>, call: &api::message::ToolCall) {
+    let Some(tool) = call.tool.as_ref() else {
+        return;
+    };
+    let Some(name) = tools::tool_call_to_anthropic_name(tool) else {
+        return; // Tool not yet wired into the proxy.
+    };
+    let block = ContentBlock::ToolUse {
+        id: call.tool_call_id.clone(),
+        name: name.to_string(),
+        input: tools::tool_call_to_anthropic_input(tool),
+    };
+    if let Some(last) = messages.last_mut() {
+        if last.role == ChatRole::Assistant {
+            last.content.push(block);
+            return;
+        }
+    }
+    messages.push(ChatMessage {
+        role: ChatRole::Assistant,
+        content: vec![block],
+    });
+}
+
+fn push_tool_result(messages: &mut Vec<ChatMessage>, result: &api::message::ToolCallResult) {
+    let (text, is_error) = tools::render_message_result(result);
+    push_tool_result_block(messages, result.tool_call_id.clone(), text, is_error);
+}
+
+fn push_input_tool_result(
+    messages: &mut Vec<ChatMessage>,
+    result: &api::request::input::ToolCallResult,
+) {
+    let (text, is_error) = tools::render_input_result(result);
+    push_tool_result_block(messages, result.tool_call_id.clone(), text, is_error);
+}
+
+fn push_tool_result_block(
+    messages: &mut Vec<ChatMessage>,
+    tool_use_id: String,
+    content: String,
+    is_error: bool,
+) {
+    let block = ContentBlock::ToolResult {
+        tool_use_id,
+        content,
+        is_error,
+    };
+    if let Some(last) = messages.last_mut() {
+        if last.role == ChatRole::User {
+            last.content.push(block);
+            return;
+        }
+    }
+    messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: vec![block],
+    });
+}
+
 pub struct ConversationCtx {
     pub active_task_id: String,
     pub new_user_text: String,
-}
-
-fn message_to_text(payload: &api::message::Message) -> Option<(ChatRole, String)> {
-    use api::message::Message as M;
-    match payload {
-        M::UserQuery(uq) => Some((ChatRole::User, uq.query.clone())),
-        M::AgentOutput(ao) => Some((ChatRole::Assistant, ao.text.clone())),
-        // Phase 2.2+ will surface tool calls/results.
-        _ => None,
-    }
 }
 
 pub struct StreamIds {
@@ -120,7 +233,7 @@ impl StreamIds {
     }
 }
 
-fn new_uuid() -> String {
+pub fn new_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
@@ -221,25 +334,29 @@ pub mod build {
         }
     }
 
+    /// Emit the user's message + an empty assistant text message that subsequent text deltas
+    /// will append into. Returns the `Message` struct ID we used for the assistant message
+    /// (caller-derived from `StreamIds`).
     pub fn add_user_and_assistant(
         ids: &StreamIds,
         user_text: &str,
         request_id: &str,
     ) -> api::ClientAction {
-        let user_msg = api::Message {
-            id: ids.user_message_id.clone(),
-            task_id: ids.task_id.clone(),
-            request_id: request_id.to_string(),
-            timestamp: Some(now_timestamp()),
-            message: Some(api::message::Message::UserQuery(
-                api::message::UserQuery {
+        let mut messages: Vec<api::Message> = Vec::new();
+        if !user_text.is_empty() {
+            messages.push(api::Message {
+                id: ids.user_message_id.clone(),
+                task_id: ids.task_id.clone(),
+                request_id: request_id.to_string(),
+                timestamp: Some(now_timestamp()),
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
                     query: user_text.to_string(),
                     ..Default::default()
-                },
-            )),
-            ..Default::default()
-        };
-        let assistant_msg = api::Message {
+                })),
+                ..Default::default()
+            });
+        }
+        messages.push(api::Message {
             id: ids.assistant_message_id.clone(),
             task_id: ids.task_id.clone(),
             request_id: request_id.to_string(),
@@ -250,12 +367,7 @@ pub mod build {
                 },
             )),
             ..Default::default()
-        };
-        let messages = if user_text.is_empty() {
-            vec![assistant_msg]
-        } else {
-            vec![user_msg, assistant_msg]
-        };
+        });
         api::ClientAction {
             action: Some(api::client_action::Action::AddMessagesToTask(
                 api::client_action::AddMessagesToTask {
@@ -266,10 +378,13 @@ pub mod build {
         }
     }
 
-    pub fn append_to_assistant(ids: &StreamIds, delta: String) -> api::ClientAction {
+    /// Append text to the *most recent* assistant text message identified by `assistant_message_id`.
+    /// The proxy may emit several assistant text messages (one per Anthropic text content block);
+    /// each is created via [`add_assistant_text_message`] and then appended into.
+    pub fn append_to_assistant(message_id: &str, task_id: &str, delta: String) -> api::ClientAction {
         let message = api::Message {
-            id: ids.assistant_message_id.clone(),
-            task_id: ids.task_id.clone(),
+            id: message_id.to_string(),
+            task_id: task_id.to_string(),
             message: Some(api::message::Message::AgentOutput(
                 api::message::AgentOutput { text: delta },
             )),
@@ -278,11 +393,66 @@ pub mod build {
         api::ClientAction {
             action: Some(api::client_action::Action::AppendToMessageContent(
                 api::client_action::AppendToMessageContent {
-                    task_id: ids.task_id.clone(),
+                    task_id: task_id.to_string(),
                     message: Some(message),
                     mask: Some(FieldMask {
                         paths: vec!["agent_output.text".to_string()],
                     }),
+                },
+            )),
+        }
+    }
+
+    /// Add a fresh empty assistant-text Message to the task — used when the model produces
+    /// a text content block *after* a tool call (so the prior assistant message is already
+    /// closed).
+    pub fn add_assistant_text_message(
+        message_id: &str,
+        task_id: &str,
+        request_id: &str,
+    ) -> api::ClientAction {
+        api::ClientAction {
+            action: Some(api::client_action::Action::AddMessagesToTask(
+                api::client_action::AddMessagesToTask {
+                    task_id: task_id.to_string(),
+                    messages: vec![api::Message {
+                        id: message_id.to_string(),
+                        task_id: task_id.to_string(),
+                        request_id: request_id.to_string(),
+                        timestamp: Some(now_timestamp()),
+                        message: Some(api::message::Message::AgentOutput(
+                            api::message::AgentOutput {
+                                text: String::new(),
+                            },
+                        )),
+                        ..Default::default()
+                    }],
+                },
+            )),
+        }
+    }
+
+    /// Add a tool-call Message into the task. The message ID + tool_call_id come from the
+    /// caller (typically `tool_use.id` straight from the provider so the Warp client and the
+    /// next-round tool result line up).
+    pub fn add_tool_call_message(
+        message_id: &str,
+        task_id: &str,
+        request_id: &str,
+        tool_call: api::message::ToolCall,
+    ) -> api::ClientAction {
+        api::ClientAction {
+            action: Some(api::client_action::Action::AddMessagesToTask(
+                api::client_action::AddMessagesToTask {
+                    task_id: task_id.to_string(),
+                    messages: vec![api::Message {
+                        id: message_id.to_string(),
+                        task_id: task_id.to_string(),
+                        request_id: request_id.to_string(),
+                        timestamp: Some(now_timestamp()),
+                        message: Some(api::message::Message::ToolCall(tool_call)),
+                        ..Default::default()
+                    }],
                 },
             )),
         }

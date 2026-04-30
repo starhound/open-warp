@@ -1,13 +1,11 @@
 //! `warp_proxy_server` — self-hosted proxy that speaks Warp's multi-agent API
 //! over HTTP+SSE+protobuf, translating each request into a call to a user-configured
-//! provider (Anthropic today; OpenAI-compat and Ollama queued for the next phase).
-//!
-//! The proxy preserves Warp's wire protocol so the upstream client doesn't need to know
-//! anything beyond the `--server-root-url` override and that login is bypassed for the
-//! OSS channel.
+//! provider. Anthropic Messages API is fully wired (chat + tool use); OpenAI-compat and
+//! Ollama are stubbed for follow-up phases.
 
 pub mod config;
 pub mod providers;
+pub mod tools;
 pub mod translate;
 
 use anyhow::Result;
@@ -18,12 +16,12 @@ use axum::{
     response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
-use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use prost::Message;
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use warp_multi_agent_api as api;
 
 pub use config::{Provider, ProxyConfig};
@@ -85,7 +83,7 @@ async fn handle_multi_agent(State(state): State<AppState>, body: Bytes) -> Respo
         ),
         Provider::OpenAiCompat { .. } | Provider::Ollama { .. } => {
             return sse_response(vec![translate::build::finished_error(
-                "provider not yet wired (Phase 2.2)".into(),
+                "provider not yet wired (Phase 2.3)".into(),
             )]);
         }
     };
@@ -102,6 +100,26 @@ async fn handle_passive_suggestions(State(_state): State<AppState>, body: Bytes)
     sse_response(vec![translate::build::finished_done()])
 }
 
+/// State for tracking in-progress content blocks that arrive interleaved on the SSE stream.
+/// The provider may emit multiple text blocks and/or tool_use blocks, identified by the
+/// block index. Each tool_use block accumulates partial JSON until its `BlockStop`.
+#[derive(Default)]
+struct StreamState {
+    /// `index` -> block kind state
+    blocks: HashMap<u32, BlockState>,
+    /// The most-recent assistant text-message ID we've created. Append-deltas target this.
+    current_text_message_id: Option<String>,
+}
+
+enum BlockState {
+    Text { message_id: String },
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
+}
+
 fn build_response_stream(
     ids: translate::StreamIds,
     conv_ctx: translate::ConversationCtx,
@@ -113,6 +131,8 @@ fn build_response_stream(
     stream! {
         yield translate::build::stream_init(&ids);
 
+        // Setup: open transaction, create task if needed, add the user message + an empty
+        // assistant text message that the first text-delta block will append into.
         let mut setup_actions: Vec<api::ClientAction> =
             vec![translate::build::begin_transaction()];
         if conv_ctx.active_task_id.is_empty() {
@@ -125,15 +145,125 @@ fn build_response_stream(
         ));
         yield translate::build::client_actions(setup_actions);
 
+        let mut state = StreamState::default();
+        // The initial assistant text message has the assistant_message_id from setup.
+        state.current_text_message_id = Some(ids.assistant_message_id.clone());
+
         let mut errored: Option<String> = None;
 
         while let Some(event) = chat_stream.next().await {
             match event {
-                ChatEvent::TextDelta(text) => {
-                    if !text.is_empty() {
-                        yield translate::build::client_actions(vec![
-                            translate::build::append_to_assistant(&ids, text),
-                        ]);
+                ChatEvent::TextDelta { index, text } => {
+                    if text.is_empty() { continue; }
+                    let message_id = match state.blocks.get(&index) {
+                        Some(BlockState::Text { message_id }) => message_id.clone(),
+                        _ => {
+                            // First time we're seeing this index: it's either the initial
+                            // assistant message (already created in setup) or a new text
+                            // segment after a tool call.
+                            let need_new_message = !matches!(
+                                state.current_text_message_id.as_deref(),
+                                Some(id) if id == ids.assistant_message_id && state.blocks.is_empty()
+                            );
+                            let message_id = if need_new_message
+                                && state.current_text_message_id.is_some()
+                                && state
+                                    .blocks
+                                    .values()
+                                    .any(|b| matches!(b, BlockState::ToolUse { .. }))
+                            {
+                                let id = translate::new_uuid();
+                                yield translate::build::client_actions(vec![
+                                    translate::build::add_assistant_text_message(
+                                        &id, &ids.task_id, &ids.request_id,
+                                    ),
+                                ]);
+                                id
+                            } else {
+                                state
+                                    .current_text_message_id
+                                    .clone()
+                                    .unwrap_or_else(|| ids.assistant_message_id.clone())
+                            };
+                            state
+                                .blocks
+                                .insert(index, BlockState::Text { message_id: message_id.clone() });
+                            state.current_text_message_id = Some(message_id.clone());
+                            message_id
+                        }
+                    };
+                    yield translate::build::client_actions(vec![
+                        translate::build::append_to_assistant(&message_id, &ids.task_id, text),
+                    ]);
+                }
+                ChatEvent::ToolUseStart { index, id, name } => {
+                    state.blocks.insert(
+                        index,
+                        BlockState::ToolUse {
+                            id,
+                            name,
+                            input_json: String::new(),
+                        },
+                    );
+                }
+                ChatEvent::ToolUseInputDelta { index, partial_json } => {
+                    if let Some(BlockState::ToolUse { input_json, .. }) =
+                        state.blocks.get_mut(&index)
+                    {
+                        input_json.push_str(&partial_json);
+                    }
+                }
+                ChatEvent::BlockStop { index } => {
+                    if let Some(block) = state.blocks.remove(&index) {
+                        match block {
+                            BlockState::Text { .. } => {
+                                // Nothing to do — text was streamed via deltas.
+                            }
+                            BlockState::ToolUse {
+                                id,
+                                name,
+                                input_json,
+                            } => {
+                                let input_value: serde_json::Value =
+                                    if input_json.trim().is_empty() {
+                                        serde_json::Value::Object(Default::default())
+                                    } else {
+                                        match serde_json::from_str(&input_json) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "failed to parse tool input JSON for {name}: {e}; raw: {input_json}"
+                                                );
+                                                serde_json::Value::Object(Default::default())
+                                            }
+                                        }
+                                    };
+                                match tools::anthropic_tool_use_to_warp(&name, id.clone(), input_value) {
+                                    Ok(call) => {
+                                        // Use the provider's tool_use id as the Warp Message ID
+                                        // too, so the next-round ToolCallResult.tool_call_id maps
+                                        // back to this one.
+                                        yield translate::build::client_actions(vec![
+                                            translate::build::add_tool_call_message(
+                                                &id,
+                                                &ids.task_id,
+                                                &ids.request_id,
+                                                call,
+                                            ),
+                                        ]);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "failed to translate tool_use {name}: {e}"
+                                        );
+                                        errored = Some(format!(
+                                            "open-warp-proxy: tool {name} not supported"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 ChatEvent::Done { .. } => break,
