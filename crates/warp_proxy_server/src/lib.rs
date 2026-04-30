@@ -4,6 +4,7 @@
 //! Ollama are stubbed for follow-up phases.
 
 pub mod config;
+pub mod login;
 pub mod providers;
 pub mod tools;
 pub mod translate;
