@@ -75,9 +75,12 @@ impl AuthState {
 
     /// Creates and initializes auth state. Checks, in order:
     /// 1. Test user (test/integration/skip_login builds)
-    /// 2. Provided API key
-    /// 3. WARP_USER_SECRET environment variable
-    /// 4. Persisted user from secure storage
+    /// 2. OSS channel — synthesize a stub user so the UI never asks for Warp signup.
+    ///    The actual AI requests bypass `get_or_refresh_access_token` and route through
+    ///    the user's self-hosted proxy, so the credential value here is purely cosmetic.
+    /// 3. Provided API key
+    /// 4. WARP_USER_SECRET environment variable
+    /// 5. Persisted user from secure storage
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub fn initialize(ctx: &AppContext, api_key: Option<String>) -> Self {
         let state = Self::new(ctx);
@@ -86,6 +89,16 @@ impl AuthState {
             state.set_user(Some(User::test()));
             #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]
             state.set_credentials(Some(Credentials::Test));
+            return state;
+        }
+
+        if ChannelState::channel() == Channel::Oss {
+            log::info!("OSS channel: skipping Warp signup; using stub credentials.");
+            state.set_user(Some(User::test()));
+            state.set_credentials(Some(Credentials::ApiKey {
+                key: format!("{API_KEY_PREFIX}open-warp-local"),
+                owner_type: None,
+            }));
             return state;
         }
 
