@@ -40,7 +40,10 @@ use warp_cli::{
     task::{MessageCommand, TaskCommand},
     CliCommand, GlobalOptions,
 };
-use warp_core::features::FeatureFlag;
+use warp_core::{
+    channel::{Channel, ChannelState},
+    features::FeatureFlag,
+};
 use warp_isolation_platform::IsolationPlatformError;
 #[cfg(not(target_family = "wasm"))]
 use warp_logging::log_file_path;
@@ -1303,8 +1306,9 @@ fn launch_command(
 
     let cli_name = warp_cli::binary_name().unwrap_or_else(|| "warp".to_string());
 
+    // OSS channel routes AI to a self-hosted proxy and does not require Warp account login.
     let auth_state = AuthStateProvider::handle(ctx).as_ref(ctx).get();
-    if !auth_state.is_logged_in() {
+    if ChannelState::channel() != Channel::Oss && !auth_state.is_logged_in() {
         return Err(anyhow::anyhow!(
             "You are not logged in - please log in with `{cli_name} login` to continue."
         ));

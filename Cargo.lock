@@ -14779,6 +14779,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp_proxy_server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "env_logger",
+ "futures-util",
+ "log",
+ "prost 0.14.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "warp_multi_agent_api",
+]
+
+[[package]]
 name = "warp_ripgrep"
 version = "0.1.0"
 dependencies = [

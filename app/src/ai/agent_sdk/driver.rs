@@ -79,7 +79,11 @@ use uuid::Uuid;
 use warp_cli::agent::{Harness, OutputFormat};
 use warp_cli::mcp::MCPSpec;
 use warp_cli::share::ShareRequest;
-use warp_core::{features::FeatureFlag, report_error, report_if_error, safe_debug, safe_info};
+use warp_core::{
+    channel::{Channel, ChannelState},
+    features::FeatureFlag,
+    report_error, report_if_error, safe_debug, safe_info,
+};
 use warp_graphql::ai::AgentTaskState;
 use warp_managed_secrets::ManagedSecretValue;
 use warpui::{
@@ -497,7 +501,10 @@ impl AgentDriver {
 
         // If we're not logged in, the root view will go to an auth screen, and all subsequent steps will fail.
         // This should be impossible, since we enforce login before reaching this point.
-        if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
+        // OSS channel routes AI to a self-hosted proxy and does not require Warp account login.
+        if ChannelState::channel() != Channel::Oss
+            && !AuthStateProvider::as_ref(ctx).get().is_logged_in()
+        {
             return Err(AgentDriverError::NotLoggedIn);
         }
 
