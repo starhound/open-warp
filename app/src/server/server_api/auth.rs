@@ -10,6 +10,7 @@ use instant::Duration;
 use mockall::{automock, predicate::*};
 use oauth2::TokenResponse;
 use thiserror::Error;
+use warp_core::channel::Channel;
 use warp_core::errors::{AnyhowErrorExt, ErrorExt};
 use warp_graphql::client::Operation;
 use warp_graphql::mutations::expire_api_key::{
@@ -243,6 +244,12 @@ impl AuthClient for ServerApi {
     async fn get_or_refresh_access_token(&self) -> Result<AuthToken> {
         if cfg!(feature = "skip_login") {
             bail!("skip_login enabled; failing all authenticated requests");
+        }
+
+        // OSS channel routes through a self-hosted proxy and never authenticates
+        // against Warp's servers — bypass the credentials check entirely.
+        if ChannelState::channel() == Channel::Oss {
+            return Ok(AuthToken::NoAuth);
         }
 
         let Some(credentials) = self.auth_state.credentials() else {

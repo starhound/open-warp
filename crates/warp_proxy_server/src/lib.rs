@@ -1,11 +1,14 @@
-//! `warp_proxy_server` — self-hosted proxy implementing Warp's multi-agent API
-//! over HTTP+SSE+protobuf. Translates incoming Warp `Request` protos to user-configured
-//! LLM provider calls (Ollama, Anthropic, OpenAI-compatible) and emits Warp `ResponseEvent`
-//! protos as SSE.
+//! `warp_proxy_server` — self-hosted proxy that speaks Warp's multi-agent API
+//! over HTTP+SSE+protobuf, translating each request into a call to a user-configured
+//! provider (Anthropic today; OpenAI-compat and Ollama queued for the next phase).
 //!
-//! Phase 2.0 status: scaffold only. The handler accepts requests, decodes the proto, logs
-//! it, and returns a `StreamFinished` event with an error message. Translation is a TODO
-//! tracked under Phase 2.1+.
+//! The proxy preserves Warp's wire protocol so the upstream client doesn't need to know
+//! anything beyond the `--server-root-url` override and that login is bypassed for the
+//! OSS channel.
+
+pub mod config;
+pub mod providers;
+pub mod translate;
 
 use anyhow::Result;
 use axum::{
@@ -15,56 +18,41 @@ use axum::{
     response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
+use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
+use base64::Engine;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use prost::Message;
 use std::{net::SocketAddr, sync::Arc};
 use warp_multi_agent_api as api;
 
-#[derive(Clone, Default)]
-pub struct ProxyConfig {
-    /// Default provider to route requests to. Phase 2.0 is unimplemented; this field
-    /// is a placeholder for the upcoming provider config (Ollama URL, Anthropic key, etc.).
-    pub provider: ProviderKind,
+pub use config::{Provider, ProxyConfig};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<ProxyConfig>,
+    pub http: reqwest::Client,
 }
 
-#[derive(Clone, Debug, Default)]
-pub enum ProviderKind {
-    /// No provider configured. Returns a `StreamFinished` error event.
-    #[default]
-    Unconfigured,
-    /// Ollama-compatible HTTP endpoint.
-    Ollama { base_url: String, model: String },
-    /// Anthropic Messages API.
-    Anthropic { api_key: String, model: String },
-    /// OpenAI Chat Completions–compatible endpoint (OpenAI, OpenRouter, vLLM, LM Studio…).
-    OpenAiCompat {
-        base_url: String,
-        api_key: Option<String>,
-        model: String,
-    },
-}
-
-/// Build the axum `Router` for the proxy. The caller is responsible for binding it to a
-/// listener.
-pub fn router(config: ProxyConfig) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/ai/multi-agent", post(handle_multi_agent))
         .route("/ai/passive-suggestions", post(handle_passive_suggestions))
-        .with_state(Arc::new(config))
+        .with_state(state)
 }
 
-/// Bind to `addr` and serve until the process is killed. Convenience helper for the binary.
 pub async fn serve(addr: SocketAddr, config: ProxyConfig) -> Result<()> {
+    let state = AppState {
+        config: Arc::new(config),
+        http: reqwest::Client::new(),
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     log::info!("warp_proxy_server listening on http://{addr}");
-    axum::serve(listener, router(config)).await?;
+    axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
-async fn handle_multi_agent(
-    State(_config): State<Arc<ProxyConfig>>,
-    body: Bytes,
-) -> Response {
+async fn handle_multi_agent(State(state): State<AppState>, body: Bytes) -> Response {
     let request = match api::Request::decode(body.as_ref()) {
         Ok(r) => r,
         Err(e) => {
@@ -73,57 +61,130 @@ async fn handle_multi_agent(
         }
     };
 
-    log::debug!("received multi-agent request: input={:?}", request.input);
+    let (chat, conv_ctx) = match translate::request_to_chat(&request) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            log::warn!("translate: {reason}");
+            return sse_response(vec![translate::build::finished_error(reason.to_string())]);
+        }
+    };
 
-    let unimplemented = unimplemented_event(
-        "open-warp-proxy: provider translation is not implemented yet (Phase 2.0 scaffold).",
-    );
-    sse_response(vec![unimplemented])
+    let ids = translate::StreamIds::new_for(&request, &conv_ctx);
+
+    let chat_stream = match &state.config.provider {
+        Provider::Anthropic {
+            api_key,
+            base_url,
+            model,
+        } => providers::anthropic::chat_stream(
+            state.http.clone(),
+            base_url.clone(),
+            api_key.clone(),
+            model.clone(),
+            chat,
+        ),
+        Provider::OpenAiCompat { .. } | Provider::Ollama { .. } => {
+            return sse_response(vec![translate::build::finished_error(
+                "provider not yet wired (Phase 2.2)".into(),
+            )]);
+        }
+    };
+
+    let response_stream = build_response_stream(ids, conv_ctx, chat_stream);
+    sse_stream_response(response_stream)
 }
 
-async fn handle_passive_suggestions(
-    State(_config): State<Arc<ProxyConfig>>,
-    body: Bytes,
-) -> Response {
+async fn handle_passive_suggestions(State(_state): State<AppState>, body: Bytes) -> Response {
     if let Err(e) = api::Request::decode(body.as_ref()) {
         log::warn!("failed to decode passive-suggestions request: {e}");
         return (StatusCode::BAD_REQUEST, format!("decode error: {e}")).into_response();
     }
-    let unimplemented = unimplemented_event(
-        "open-warp-proxy: passive suggestions not implemented (Phase 2.0 scaffold).",
-    );
-    sse_response(vec![unimplemented])
+    sse_response(vec![translate::build::finished_done()])
 }
 
-fn unimplemented_event(message: &str) -> api::ResponseEvent {
-    use api::response_event::stream_finished;
+fn build_response_stream(
+    ids: translate::StreamIds,
+    conv_ctx: translate::ConversationCtx,
+    mut chat_stream: providers::ChatStream,
+) -> impl futures_util::Stream<Item = api::ResponseEvent> + Send {
+    use async_stream::stream;
+    use providers::ChatEvent;
 
-    api::ResponseEvent {
-        r#type: Some(api::response_event::Type::Finished(
-            api::response_event::StreamFinished {
-                reason: Some(stream_finished::Reason::InternalError(
-                    stream_finished::InternalError {
-                        message: message.to_string(),
-                    },
-                )),
-                ..Default::default()
-            },
-        )),
+    stream! {
+        yield translate::build::stream_init(&ids);
+
+        let mut setup_actions: Vec<api::ClientAction> =
+            vec![translate::build::begin_transaction()];
+        if conv_ctx.active_task_id.is_empty() {
+            setup_actions.push(translate::build::create_task(&ids.task_id));
+        }
+        setup_actions.push(translate::build::add_user_and_assistant(
+            &ids,
+            &conv_ctx.new_user_text,
+            &ids.request_id,
+        ));
+        yield translate::build::client_actions(setup_actions);
+
+        let mut errored: Option<String> = None;
+
+        while let Some(event) = chat_stream.next().await {
+            match event {
+                ChatEvent::TextDelta(text) => {
+                    if !text.is_empty() {
+                        yield translate::build::client_actions(vec![
+                            translate::build::append_to_assistant(&ids, text),
+                        ]);
+                    }
+                }
+                ChatEvent::Done { .. } => break,
+                ChatEvent::Error(msg) => {
+                    errored = Some(msg);
+                    break;
+                }
+            }
+        }
+
+        yield translate::build::client_actions(vec![translate::build::commit_transaction()]);
+
+        match errored {
+            None => yield translate::build::finished_done(),
+            Some(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("invalid_api_key")
+                    || lower.contains("authentication_error")
+                    || lower.contains("401")
+                {
+                    yield translate::build::finished_invalid_api_key("anthropic");
+                } else {
+                    yield translate::build::finished_error(msg);
+                }
+            }
+        }
     }
 }
 
-fn sse_response(events: Vec<api::ResponseEvent>) -> Response {
+/// Convert a stream of `ResponseEvent`s into an SSE response, encoding each as a base64
+/// payload (matching what the Warp client decodes via `BASE64_URL_SAFE.decode`).
+fn sse_stream_response(
+    stream: impl futures_util::Stream<Item = api::ResponseEvent> + Send + 'static,
+) -> Response {
     use axum::response::sse::{KeepAlive, Sse};
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
-    use futures_util::stream;
 
-    let stream = stream::iter(events.into_iter().map(|event| {
+    let sse = stream.map(|event| {
         let mut buf = Vec::with_capacity(event.encoded_len());
-        event.encode(&mut buf).expect("ResponseEvent::encode is infallible into Vec");
+        event
+            .encode(&mut buf)
+            .expect("ResponseEvent::encode is infallible into Vec");
         let payload = format!("\"{}\"", BASE64_URL_SAFE.encode(buf));
         Ok::<Event, std::convert::Infallible>(Event::default().data(payload))
-    }));
+    });
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(sse).keep_alive(KeepAlive::default()).into_response()
+}
+
+/// Convenience for emitting a small bounded list of events as SSE — used for error-only
+/// responses where there's no provider stream to consume.
+fn sse_response(events: Vec<api::ResponseEvent>) -> Response {
+    use futures_util::stream;
+    sse_stream_response(stream::iter(events))
 }
