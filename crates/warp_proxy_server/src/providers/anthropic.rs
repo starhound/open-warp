@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ChatEvent, ChatRequest, ChatRole, ChatStream, ContentBlock};
+use crate::config::AnthropicAuth;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -132,7 +133,7 @@ struct AnthropicError {
 pub fn chat_stream(
     client: reqwest::Client,
     base_url: String,
-    api_key: String,
+    auth: AnthropicAuth,
     model: String,
     request: ChatRequest,
 ) -> ChatStream {
@@ -201,12 +202,17 @@ pub fn chat_stream(
     };
 
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-    let req_builder = client
+    let mut req_builder = client
         .post(url)
-        .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header("content-type", "application/json")
         .body(body_json);
+    req_builder = match auth {
+        AnthropicAuth::ApiKey(key) => req_builder.header("x-api-key", key),
+        AnthropicAuth::BearerToken(tok) => {
+            req_builder.header("authorization", format!("Bearer {tok}"))
+        }
+    };
 
     let mut event_source = match EventSource::new(req_builder) {
         Ok(es) => es,

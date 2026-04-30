@@ -24,7 +24,7 @@ use prost::Message;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use warp_multi_agent_api as api;
 
-pub use config::{Provider, ProxyConfig};
+pub use config::{AnthropicAuth, Provider, ProxyConfig};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -71,13 +71,13 @@ async fn handle_multi_agent(State(state): State<AppState>, body: Bytes) -> Respo
 
     let chat_stream = match &state.config.provider {
         Provider::Anthropic {
-            api_key,
+            auth,
             base_url,
             model,
         } => providers::anthropic::chat_stream(
             state.http.clone(),
             base_url.clone(),
-            api_key.clone(),
+            auth.clone(),
             model.clone(),
             chat,
         ),

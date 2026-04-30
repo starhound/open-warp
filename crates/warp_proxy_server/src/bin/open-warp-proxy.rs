@@ -33,10 +33,15 @@ async fn main() -> anyhow::Result<()> {
 
 /// Stringifies the provider config with API keys redacted, for logging.
 fn redact_secrets(cfg: &ProxyConfig) -> String {
+    use warp_proxy_server::config::AnthropicAuth;
     use warp_proxy_server::Provider;
     match &cfg.provider {
-        Provider::Anthropic { base_url, model, .. } => {
-            format!("Anthropic {{ base_url: {base_url:?}, model: {model:?} }}")
+        Provider::Anthropic { auth, base_url, model } => {
+            let auth_kind = match auth {
+                AnthropicAuth::ApiKey(_) => "api_key",
+                AnthropicAuth::BearerToken(_) => "bearer_token",
+            };
+            format!("Anthropic {{ base_url: {base_url:?}, model: {model:?}, auth: {auth_kind} }}")
         }
         Provider::OpenAiCompat {
             base_url,

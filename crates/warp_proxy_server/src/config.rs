@@ -11,7 +11,7 @@ pub struct ProxyConfig {
 #[derive(Clone, Debug)]
 pub enum Provider {
     Anthropic {
-        api_key: String,
+        auth: AnthropicAuth,
         base_url: String,
         model: String,
     },
@@ -26,14 +26,27 @@ pub enum Provider {
     },
 }
 
+/// Anthropic authentication mode. The Messages API accepts either a direct API key
+/// (`x-api-key` header, the standard `sk-ant-...` keys) or a bearer token (typically an
+/// OAuth/OIDC-issued credential).
+#[derive(Clone, Debug)]
+pub enum AnthropicAuth {
+    /// `x-api-key: <key>`
+    ApiKey(String),
+    /// `Authorization: Bearer <token>`
+    BearerToken(String),
+}
+
 impl ProxyConfig {
     /// Build a [`ProxyConfig`] from environment variables.
     ///
     /// `OPEN_WARP_PROVIDER` selects the provider (`anthropic`, `openai_compat`, `ollama`). The
     /// remaining keys depend on the provider:
     ///
-    /// - **anthropic**: `OPEN_WARP_API_KEY` (required), `OPEN_WARP_MODEL` (default
-    ///   `claude-sonnet-4-5`), `OPEN_WARP_BASE_URL` (default `https://api.anthropic.com`).
+    /// - **anthropic**: one of `OPEN_WARP_API_KEY` (uses `x-api-key`) or
+    ///   `OPEN_WARP_BEARER_TOKEN` (uses `Authorization: Bearer`, for OIDC/OAuth-issued
+    ///   credentials). `OPEN_WARP_MODEL` (default `claude-sonnet-4-5`),
+    ///   `OPEN_WARP_BASE_URL` (default `https://api.anthropic.com`).
     /// - **openai_compat**: `OPEN_WARP_BASE_URL` (required), `OPEN_WARP_MODEL` (required),
     ///   `OPEN_WARP_API_KEY` (optional).
     /// - **ollama**: `OPEN_WARP_BASE_URL` (default `http://127.0.0.1:11434`),
@@ -46,8 +59,8 @@ impl ProxyConfig {
 
         let provider = match kind.as_str() {
             "anthropic" => Provider::Anthropic {
-                api_key: env_required("OPEN_WARP_API_KEY")
-                    .context("anthropic provider requires OPEN_WARP_API_KEY")?,
+                auth: anthropic_auth_from_env()
+                    .context("anthropic provider requires OPEN_WARP_API_KEY or OPEN_WARP_BEARER_TOKEN")?,
                 base_url: env_or("OPEN_WARP_BASE_URL", "https://api.anthropic.com"),
                 model: env_or("OPEN_WARP_MODEL", "claude-sonnet-4-5"),
             },
@@ -79,4 +92,14 @@ fn env_required(key: &str) -> Result<String> {
         bail!("{key} is empty");
     }
     Ok(value)
+}
+
+fn anthropic_auth_from_env() -> Result<AnthropicAuth> {
+    if let Ok(token) = std::env::var("OPEN_WARP_BEARER_TOKEN") {
+        if !token.trim().is_empty() {
+            return Ok(AnthropicAuth::BearerToken(token));
+        }
+    }
+    let key = env_required("OPEN_WARP_API_KEY")?;
+    Ok(AnthropicAuth::ApiKey(key))
 }
