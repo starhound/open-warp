@@ -69,19 +69,29 @@ async fn handle_multi_agent(State(state): State<AppState>, body: Bytes) -> Respo
     };
 
     let ids = translate::StreamIds::new_for(&request, &conv_ctx);
+    let in_app_keys = translate::RequestApiKeys::from_request(&request);
 
     let chat_stream = match &state.config.provider {
         Provider::Anthropic {
             auth,
             base_url,
             model,
-        } => providers::anthropic::chat_stream(
-            state.http.clone(),
-            base_url.clone(),
-            auth.clone(),
-            model.clone(),
-            chat,
-        ),
+        } => {
+            // The in-app BYOK key (entered in open-warp Settings → AI) takes precedence over
+            // the proxy's env-configured credential, so users can rotate keys without
+            // restarting the proxy.
+            let effective_auth = match &in_app_keys.anthropic {
+                Some(key) => config::AnthropicAuth::ApiKey(key.clone()),
+                None => auth.clone(),
+            };
+            providers::anthropic::chat_stream(
+                state.http.clone(),
+                base_url.clone(),
+                effective_auth,
+                model.clone(),
+                chat,
+            )
+        }
         Provider::OpenAiCompat { .. } | Provider::Ollama { .. } => {
             return sse_response(vec![translate::build::finished_error(
                 "provider not yet wired (Phase 2.3)".into(),

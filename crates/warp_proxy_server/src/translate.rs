@@ -12,6 +12,36 @@ use warp_multi_agent_api as api;
 use crate::providers::{ChatMessage, ChatRequest, ChatRole, ContentBlock, ToolSpec};
 use crate::tools;
 
+/// Per-provider key extracted from `request.settings.api_keys` if the in-app BYOK UI has
+/// supplied one. The proxy prefers this over its env-configured credentials so the user's
+/// keychain-stored key wins.
+#[derive(Default, Debug, Clone)]
+pub struct RequestApiKeys {
+    pub anthropic: Option<String>,
+    pub openai: Option<String>,
+    pub google: Option<String>,
+    pub open_router: Option<String>,
+}
+
+impl RequestApiKeys {
+    pub fn from_request(req: &api::Request) -> Self {
+        let Some(keys) = req
+            .settings
+            .as_ref()
+            .and_then(|s| s.api_keys.as_ref())
+        else {
+            return Self::default();
+        };
+        let opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
+        Self {
+            anthropic: opt(&keys.anthropic),
+            openai: opt(&keys.openai),
+            google: opt(&keys.google),
+            open_router: opt(&keys.open_router),
+        }
+    }
+}
+
 /// Walk the request's task history + new input and build a chat-history list together with
 /// metadata about the active conversation.
 pub fn request_to_chat(req: &api::Request) -> Result<(ChatRequest, ConversationCtx), &'static str> {

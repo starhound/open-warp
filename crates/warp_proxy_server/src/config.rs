@@ -59,8 +59,15 @@ impl ProxyConfig {
 
         let provider = match kind.as_str() {
             "anthropic" => Provider::Anthropic {
-                auth: anthropic_auth_from_env()
-                    .context("anthropic provider requires OPEN_WARP_API_KEY or OPEN_WARP_BEARER_TOKEN")?,
+                // Falls back to a placeholder when neither env var is set so the proxy can start
+                // and rely entirely on the in-app BYOK key flowing in via request.settings.api_keys.
+                auth: anthropic_auth_from_env().unwrap_or_else(|_| {
+                    log::warn!(
+                        "no OPEN_WARP_API_KEY or OPEN_WARP_BEARER_TOKEN set; relying on in-app BYOK \
+                         key (configure in open-warp Settings → AI)."
+                    );
+                    AnthropicAuth::ApiKey(String::new())
+                }),
                 base_url: env_or("OPEN_WARP_BASE_URL", "https://api.anthropic.com"),
                 model: env_or("OPEN_WARP_MODEL", "claude-sonnet-4-5"),
             },
